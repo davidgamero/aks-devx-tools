@@ -14,6 +14,7 @@ import {longRunning} from '../../utils/host';
 import {
    Az,
    AzApi,
+   CONTRIBUTOR_ROLE_ID,
    getAzCreds,
    ManagedClusterItem,
    RegistryItem,
@@ -23,10 +24,9 @@ import {
 } from '../../utils/az';
 import {getAsyncResult} from '../../utils/errorable';
 import {sort} from '../../utils/sort';
-import {getBranches} from '../../utils/gitExtension';
+import {getBranches, setGitHubRepoSecret} from '../../utils/gitExtension';
 import {Branch, Ref} from '../../utils/git';
 import path = require('path');
-import {Octokit} from '@octokit/rest';
 import {createTokenAuth} from '@octokit/auth-token';
 import {getRemotes} from '../../utils/gitExtension';
 import {cat} from 'shelljs';
@@ -73,9 +73,9 @@ export async function runDraftWorkflow({
    }
 
    const promptSteps: IPromptStep[] = [
-      new PromptSetWorkflowSecret(az),
       new PromptAKSSubscriptionSelection(az),
       new PromptAKSResourceGroupSelection(az),
+      new PromptSetWorkflowSecret(az),
       new PromptAKSClusterSelection(az),
       // Currently we dont allow seperate sub for ACR selection while generating through draft
       // new PromptACRSubscriptionSelection(az),
@@ -110,68 +110,53 @@ class PromptSetWorkflowSecret extends AzureWizardPromptStep<WizardContext> {
 
    public async prompt(wizardContext: WizardContext): Promise<void> {
       vscode.window.showInformationMessage('Setting GitHub secrets...');
+      if (wizardContext.clusterSubscription === undefined) {
+         throw Error('Cluster Subscription is undefined');
+      }
+      if (wizardContext.clusterResourceGroup === undefined) {
+         throw Error('Cluster Resource Group is undefined');
+      }
 
+      const newApp = await getAsyncResult(
+         this.az.createADApp('worflowapp-' + Date.now())
+      );
+      const sp = await getAsyncResult(
+         this.az.createServicePrincipal(newApp.appId)
+      );
+      const tenantId = await getAsyncResult(this.az.getTenantId());
+      const subscriptionId = wizardContext.clusterSubscription.subscription.id;
+      if (subscriptionId === undefined) {
+         throw Error('Subscription ID is undefined');
+      }
+      const scope = `${subscriptionId}/resourceGroups/${wizardContext.clusterResourceGroup?.resourceGroup.name}`;
+      const roleAssignment = await getAsyncResult(
+         this.az.createRoleAssignment(
+            wizardContext.clusterSubscription,
+            {
+               name: '1f10b742-4ebd-4db5-9d87-1fa6ac74fb5a',
+               id: `${subscriptionId}/providers/Microsoft.Authorization/roleDefinitions/${CONTRIBUTOR_ROLE_ID}`,
+               principalType: 'ServicePrincipal'
+            },
+            sp.id,
+            scope
+         )
+      );
+
+      vscode.window.showInformationMessage(`Tenant ID: ${tenantId}`);
       const appPromise = this.az.getADAppByName('workflowapp-1678733761514');
       const app = await getAsyncResult(appPromise);
-
-      let session: vscode.AuthenticationSession | undefined;
-      try {
-         await vscode.authentication
-            .getSession('github', ['repo', 'read:public_key'], {
-               createIfNone: true
-            })
-            .then(
-               async (s) => {
-                  session = s;
-               },
-               (e) => {
-                  throw new Error(
-                     'error getting github authentication session: ' + e
-                  );
-               }
-            );
-      } catch (e) {
-         console.log(e);
-      }
-
-      if (session === undefined) {
-         vscode.window.showErrorMessage(
-            'Failed to get GitHub authentication session'
+      if (app === undefined) {
+         await setGitHubRepoSecret(
+            'davidgamero',
+            'ContosoAir',
+            'devx-workflow-app-id',
+            'test-value'
          );
+
+         getRemotes(vscode.workspace.workspaceFolders![0].uri);
+
          return;
       }
-      const octokit = new Octokit({
-         auth: session.accessToken
-      });
-      try {
-         const ghActionPublicKeyResponse =
-            await octokit.actions.getRepoPublicKey({
-               owner: 'davidgamero',
-               repo: 'ContosoAir'
-            });
-         const ghActionPublicKey = ghActionPublicKeyResponse.data;
-         if (!ghActionPublicKey.key_id) {
-            vscode.window.showErrorMessage(
-               'Failed to get GitHub Action public key'
-            );
-            return;
-         }
-         const res = await octokit.actions.createOrUpdateRepoSecret({
-            owner: 'davidgamero',
-            repo: 'ContosoAir',
-            secret_name: 'AZ_DEVX_SECRET',
-            encrypted_value:
-               Buffer.from('test-secret-value').toString('base64'),
-            key_id: ghActionPublicKey.key_id.toString()
-         });
-         console.log(res);
-      } catch (e) {
-         console.log(e);
-      }
-
-      getRemotes(vscode.workspace.workspaceFolders![0].uri);
-
-      return;
    }
 
    public shouldPrompt(wizardContext: WizardContext): boolean {

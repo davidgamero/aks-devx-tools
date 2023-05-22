@@ -38,7 +38,10 @@ import {
 } from '@azure/arm-containerservice';
 import {parseAzureResourceId} from '@microsoft/vscode-azext-azureutils';
 import {AuthorizationManagementClient} from '@azure/arm-authorization';
-import {RoleAssignment} from '@azure/arm-authorization/esm/models';
+import {
+   PrincipalType,
+   RoleAssignment
+} from '@azure/arm-authorization/esm/models';
 import 'cross-fetch/polyfill';
 import {Client as GraphClient} from '@microsoft/microsoft-graph-client';
 import {TokenCredentialAuthenticationProvider} from '@microsoft/microsoft-graph-client/authProviders/azureTokenCredentials';
@@ -46,6 +49,7 @@ import {TokenCredentialAuthenticationProvider} from '@microsoft/microsoft-graph-
 const CREATE_CERT_TIMEOUT = 300_000;
 const LATEST_ARM_RESOURCE_VERSION = '2022-01-31-PREVIEW';
 
+export const CONTRIBUTOR_ROLE_ID = 'b24988ac-6180-42a0-ab88-20f7382dd24c';
 export interface AzApi {
    listSubscriptions(): Promise<Errorable<SubscriptionItem[]>>;
    listResourceGroups(
@@ -88,7 +92,7 @@ export interface AzApi {
    ): Promise<Errorable<ManagedClusterItem>>;
    createRoleAssignment(
       subscriptionItem: SubscriptionItem,
-      role: {name: string; id: string},
+      role: {name: string; id: string; principalType?: PrincipalType},
       assignee: string,
       scope: string
    ): Promise<Errorable<RoleAssignmentItem>>;
@@ -100,7 +104,13 @@ export interface AzApi {
       keyVaultItem: KeyVaultItem,
       ...accessPolicies: AccessPolicyEntry[]
    ): Promise<Errorable<VaultAccessPolicyItem>>;
+   createADApp(name: string): Promise<Errorable<ADAppItem>>;
    getADAppByName(name: string): Promise<Errorable<ADAppItem[]>>;
+   createServicePrincipal(
+      appId: string
+   ): Promise<Errorable<ADServicePrincipalItem>>;
+   getTenantId(): Promise<Errorable<string>>;
+   getRoles(): Promise<Errorable<RoleItem[]>>;
 }
 
 export interface SubscriptionItem {
@@ -153,7 +163,19 @@ export interface VaultAccessPolicyItem {
 
 export interface ADAppItem {
    id: string;
+   appId: string;
    displayName: string;
+}
+
+export interface ADServicePrincipalItem {
+   id: string;
+   appId: string;
+   appRoles: {id: string; allowedMemberTypes: string[]; description: string}[];
+}
+
+export interface RoleItem {
+   id: string;
+   name: string;
 }
 
 type CredGetter = () => TokenCredential;
@@ -348,9 +370,10 @@ export class Az implements AzApi {
       const cred = this.getCreds();
 
       // get app's access token scoped to Microsoft Graph
-      const tokenResponse = await cred.getToken(
-         'https://graph.microsoft.com/.default'
-      );
+      const tokenResponse = await cred.getToken([
+         'https://graph.microsoft.com/.default',
+         'https://graph.microsoft.com/Application.ReadWrite.All'
+      ]);
       if (tokenResponse === null) {
          return {
             succeeded: false,
@@ -396,6 +419,135 @@ export class Az implements AzApi {
          return {
             succeeded: false,
             error: `Failed to list AD Apps for subscription ${error}`
+         };
+      }
+   }
+
+   async createADApp(name: string): Promise<Errorable<ADAppItem>> {
+      if (name === undefined) {
+         return {succeeded: false, error: 'invalid name is undefined'};
+      }
+      if (name === null) {
+         return {succeeded: false, error: 'invalid name is null'};
+      }
+      if (name === '') {
+         return {succeeded: false, error: 'invalid name is empty'};
+      }
+
+      const getGraphClientResult = await this.getGraphClient();
+      if (!getGraphClientResult.succeeded) {
+         return {
+            succeeded: false,
+            error: `Failed to get graph client ${getGraphClientResult.error}`
+         };
+      }
+      const graphClient = getGraphClientResult.result;
+      try {
+         const resp = await graphClient
+            .api(`https://graph.microsoft.com/v1.0/applications`)
+            .post({
+               displayName: name
+            });
+         const createdApp: ADAppItem = resp;
+         return {succeeded: true, result: createdApp};
+      } catch (error) {
+         return {
+            succeeded: false,
+            error: `Failed to create AD App ${error}`
+         };
+      }
+   }
+
+   async createServicePrincipal(
+      appId: string
+   ): Promise<Errorable<ADServicePrincipalItem>> {
+      if (appId === undefined) {
+         return {succeeded: false, error: 'invalid name is undefined'};
+      }
+      if (appId === null) {
+         return {succeeded: false, error: 'invalid name is null'};
+      }
+      if (appId === '') {
+         return {succeeded: false, error: 'invalid name is empty'};
+      }
+
+      const getGraphClientResult = await this.getGraphClient();
+      if (!getGraphClientResult.succeeded) {
+         return {
+            succeeded: false,
+            error: `Failed to get graph client ${getGraphClientResult.error}`
+         };
+      }
+      const graphClient = getGraphClientResult.result;
+      try {
+         const resp = await graphClient
+            .api(`https://graph.microsoft.com/v1.0/servicePrincipals`)
+            .post({
+               appId
+            });
+         const createdServicePrincipal: ADServicePrincipalItem = resp;
+         return {succeeded: true, result: createdServicePrincipal};
+      } catch (error) {
+         return {
+            succeeded: false,
+            error: `Failed to create Service Principal ${error}`
+         };
+      }
+   }
+
+   async getTenantId(): Promise<Errorable<string>> {
+      const getGraphClientResult = await this.getGraphClient();
+      if (!getGraphClientResult.succeeded) {
+         return {
+            succeeded: false,
+            error: `Failed to get graph client ${getGraphClientResult.error}`
+         };
+      }
+
+      const graphClient = getGraphClientResult.result;
+      try {
+         const resp = await graphClient
+            .api(`https://graph.microsoft.com/v1.0/organization`)
+            .get();
+         const tenants = resp.value;
+         if (tenants.length !== 1) {
+            return {
+               succeeded: false,
+               error: `Expected 1 tenant, got ${tenants.length}`
+            };
+         }
+         const tenantId: string = tenants[0].id;
+         return {succeeded: true, result: tenantId};
+      } catch (error) {
+         return {
+            succeeded: false,
+            error: `Failed to get tenant id ${error}`
+         };
+      }
+   }
+
+   async getRoles(): Promise<Errorable<RoleItem[]>> {
+      const getGraphClientResult = await this.getGraphClient();
+      if (!getGraphClientResult.succeeded) {
+         return {
+            succeeded: false,
+            error: `Failed to get graph client ${getGraphClientResult.error}`
+         };
+      }
+
+      const graphClient = getGraphClientResult.result;
+      try {
+         const resp = await graphClient
+            .api(
+               `https://graph.microsoft.com/v1.0/roleManagement/directory/roleDefinitions`
+            )
+            .get();
+         const roles = resp.value;
+         return {succeeded: true, result: roles};
+      } catch (error) {
+         return {
+            succeeded: false,
+            error: `Failed to get roles ${error}`
          };
       }
    }
@@ -576,7 +728,7 @@ export class Az implements AzApi {
 
    async createRoleAssignment(
       subscriptionItem: SubscriptionItem,
-      role: {name: string; id: string},
+      role: {name: string; id: string; principalType?: PrincipalType},
       assignee: string,
       scope: string
    ): Promise<Errorable<RoleAssignmentItem>> {
@@ -593,7 +745,8 @@ export class Az implements AzApi {
          );
          const resp = await client.roleAssignments.create(scope, role.name, {
             principalId: assignee,
-            roleDefinitionId: role.id
+            roleDefinitionId: role.id,
+            principalType: role.principalType
          });
          return {succeeded: true, result: {roleAssignment: resp}};
       } catch (error) {
